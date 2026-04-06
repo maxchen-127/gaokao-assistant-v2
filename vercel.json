@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "name": "gaokao-assistant",
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/api/index.js"
+    }
+  ],
+  "functions": {
+    "api/index.js": {
+      "memory": 1024,
+      "maxDuration": 10
+    }
+  }
+}
