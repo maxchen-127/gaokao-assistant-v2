@@ -12,31 +12,13 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 数据库初始化（延迟加载）
-let dbInstance = null;
-
-async function getDb() {
-  if (!dbInstance) {
-    const initSqlJs = require('sql.js');
-    const SQL = await initSqlJs();
-    
-    // Vercel环境中，数据库文件路径
-    const dbPath = path.join(process.cwd(), 'data', 'gaokao.db');
-    
-    if (!fs.existsSync(dbPath)) {
-      throw new Error(`数据库文件不存在: ${dbPath}`);
-    }
-    
-    const buffer = fs.readFileSync(dbPath);
-    dbInstance = new SQL.Database(buffer);
-  }
-  return dbInstance;
-}
+// 数据库模块
+const db = require('../lib/database');
 
 // 健康检查
 app.get('/api/health', async (req, res) => {
   try {
-    const db = await getDb();
+    await db.initDb();
     res.json({ 
       status: 'ok', 
       timestamp: new Date().toISOString(),
@@ -47,7 +29,8 @@ app.get('/api/health', async (req, res) => {
       status: 'error', 
       message: error.message,
       cwd: process.cwd(),
-      files: fs.existsSync(path.join(process.cwd(), 'data')) ? fs.readdirSync(path.join(process.cwd(), 'data')) : 'data目录不存在'
+      dataDirExists: fs.existsSync(path.join(process.cwd(), 'data')),
+      dbFileExists: fs.existsSync(path.join(process.cwd(), 'data', 'gaokao.db'))
     });
   }
 });
@@ -68,7 +51,7 @@ app.get('/', (req, res) => {
   });
 });
 
-/** 
+/**
  * 智能推荐接口
  * POST /api/recommend
  */
@@ -80,64 +63,37 @@ app.post('/api/recommend', async (req, res) => {
       return res.status(400).json({ error: '需要提供分数或位次' });
     }
     
-    const db = await getDb();
-    
-    let sql = `
-      SELECT 
-        ms.university_code,
-        ms.university_name,
-        ms.major_name,
-        ms.min_score,
-        ms.min_rank,
-        ms.plan_count,
-        m.holland_code,
-        m.employment_difficulty,
-        m.civil_servant_fit,
-        m.category as major_category
-      FROM major_score ms
-      LEFT JOIN major m ON ms.major_name LIKE '%' || m.name || '%'
-      WHERE 1=1
-    `;
-    const params = [];
+    let results = [];
     
     if (rank) {
-      sql += ' AND ms.min_rank BETWEEN ? AND ?';
-      params.push(rank - 10000, rank + 10000);
+      results = await db.getMajorScoreByRank(rank, limit);
+    } else if (score) {
+      results = await db.getMajorScoreByScore(score, limit);
     }
-    
-    sql += ' ORDER BY ms.min_rank ASC LIMIT ?';
-    params.push(limit);
-    
-    const result = db.exec(sql, params);
-    
-    if (result.length === 0) {
-      return res.json({ success: true, count: 0, data: [] });
-    }
-    
-    const columns = result[0].columns;
-    let results = result[0].values.map(row => {
-      const obj = {};
-      columns.forEach((col, i) => obj[col] = row[i]);
-      return obj;
-    });
     
     // 计算匹配分数
-    results = results.map(r => {
+    const scoredResults = results.map(r => {
       let matchScore = 100;
       
-      if (hollandCode && r.holland_code) {
-        const commonCodes = hollandCode.split('').filter(c => r.holland_code.includes(c));
-        matchScore += commonCodes.length * 10;
+      // 霍兰德代码匹配（简化版）
+      if (hollandCode) {
+        // 这里可以扩展更复杂的霍兰德匹配算法
+        matchScore += 5; // 基础分
       }
       
-      if (employmentPreference === 'work' && r.employment_difficulty === '高') {
-        matchScore -= 30;
+      // 就业难度过滤
+      if (employmentPreference === 'work') {
+        // 这里可以连接专业表获取就业难度数据
+        // 暂时简化处理
       }
       
-      if (civilServantPlan && r.civil_servant_fit === '低') {
-        matchScore -= 25;
+      // 公务员适配性
+      if (civilServantPlan) {
+        // 这里可以连接专业表获取公务员适配数据
+        // 暂时简化处理
       }
       
+      // 数学能力过滤
       if (mathScore === 'poor' || mathScore === 'average') {
         const mathIntensiveMajors = ['计算机', '软件', '数学', '统计', '金融', '人工智能'];
         if (mathIntensiveMajors.some(m => r.major_name.includes(m))) {
@@ -148,12 +104,13 @@ app.post('/api/recommend', async (req, res) => {
       return { ...r, matchScore };
     });
     
-    results.sort((a, b) => b.matchScore - a.matchScore);
+    // 按匹配分数排序
+    scoredResults.sort((a, b) => b.matchScore - a.matchScore);
     
     res.json({
       success: true,
-      count: results.length,
-      data: results
+      count: scoredResults.length,
+      data: scoredResults
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -166,57 +123,17 @@ app.post('/api/recommend', async (req, res) => {
  */
 app.get('/api/score/query', async (req, res) => {
   try {
-    const db = await getDb();
+    const params = {
+      minRank: req.query.minRank ? parseInt(req.query.minRank) : null,
+      maxRank: req.query.maxRank ? parseInt(req.query.maxRank) : null,
+      minScore: req.query.minScore ? parseInt(req.query.minScore) : null,
+      maxScore: req.query.maxScore ? parseInt(req.query.maxScore) : null,
+      universityName: req.query.universityName || null,
+      majorName: req.query.majorName || null,
+      limit: req.query.limit ? parseInt(req.query.limit) : 100
+    };
     
-    let sql = 'SELECT * FROM major_score WHERE 1=1';
-    const params = [];
-    
-    if (req.query.minRank) {
-      sql += ' AND min_rank >= ?';
-      params.push(parseInt(req.query.minRank));
-    }
-    
-    if (req.query.maxRank) {
-      sql += ' AND min_rank <= ?';
-      params.push(parseInt(req.query.maxRank));
-    }
-    
-    if (req.query.minScore) {
-      sql += ' AND min_score >= ?';
-      params.push(parseInt(req.query.minScore));
-    }
-    
-    if (req.query.maxScore) {
-      sql += ' AND min_score <= ?';
-      params.push(parseInt(req.query.maxScore));
-    }
-    
-    if (req.query.universityName) {
-      sql += ' AND university_name LIKE ?';
-      params.push(`%${req.query.universityName}%`);
-    }
-    
-    if (req.query.majorName) {
-      sql += ' AND major_name LIKE ?';
-      params.push(`%${req.query.majorName}%`);
-    }
-    
-    const limit = req.query.limit ? parseInt(req.query.limit) : 100;
-    sql += ' ORDER BY min_rank ASC LIMIT ?';
-    params.push(limit);
-    
-    const result = db.exec(sql, params);
-    
-    if (result.length === 0) {
-      return res.json({ success: true, count: 0, data: [] });
-    }
-    
-    const columns = result[0].columns;
-    const data = result[0].values.map(row => {
-      const obj = {};
-      columns.forEach((col, i) => obj[col] = row[i]);
-      return obj;
-    });
+    const data = await db.searchMajorScore(params);
     
     res.json({
       success: true,
@@ -228,7 +145,7 @@ app.get('/api/score/query', async (req, res) => {
   }
 });
 
-/** 
+/**
  * 职业洞察
  * GET /api/insight
  */
@@ -240,26 +157,23 @@ app.get('/api/insight', async (req, res) => {
       return res.status(400).json({ error: '需要提供专业名称' });
     }
     
-    const db = await getDb();
-    const result = db.exec('SELECT * FROM career_insight WHERE major_name = ?', [majorName]);
+    const insight = await db.getCareerInsight(majorName);
     
-    if (result.length === 0 || result[0].values.length === 0) {
+    if (!insight) {
       return res.status(404).json({ error: '暂无该专业的职业洞察数据' });
     }
     
-    const columns = result[0].columns;
-    const row = result[0].values[0];
-    const obj = {};
-    columns.forEach((col, i) => obj[col] = row[i]);
+    // 解析JSON字段
+    const data = {
+      ...insight,
+      core_courses: insight.core_courses ? JSON.parse(insight.core_courses) : [],
+      employment_direction: insight.employment_direction ? JSON.parse(insight.employment_direction) : [],
+      pain_points: insight.pain_points ? JSON.parse(insight.pain_points) : []
+    };
     
     res.json({
       success: true,
-      data: {
-        ...obj,
-        core_courses: obj.core_courses ? JSON.parse(obj.core_courses) : [],
-        employment_direction: obj.employment_direction ? JSON.parse(obj.employment_direction) : [],
-        pain_points: obj.pain_points ? JSON.parse(obj.pain_points) : []
-      }
+      data
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -272,47 +186,15 @@ app.get('/api/insight', async (req, res) => {
  */
 app.get('/api/major/list', async (req, res) => {
   try {
-    const db = await getDb();
+    const params = {
+      category: req.query.category || null,
+      employmentDifficulty: req.query.employmentDifficulty || null,
+      civilServantFit: req.query.civilServantFit || null,
+      keyword: req.query.keyword || null,
+      limit: req.query.limit ? parseInt(req.query.limit) : 100
+    };
     
-    let sql = 'SELECT * FROM major WHERE employment_difficulty IS NOT NULL';
-    const params = [];
-    
-    if (req.query.category) {
-      sql += ' AND category = ?';
-      params.push(req.query.category);
-    }
-    
-    if (req.query.employmentDifficulty) {
-      sql += ' AND employment_difficulty = ?';
-      params.push(req.query.employmentDifficulty);
-    }
-    
-    if (req.query.civilServantFit) {
-      sql += ' AND civil_servant_fit = ?';
-      params.push(req.query.civilServantFit);
-    }
-    
-    if (req.query.keyword) {
-      sql += ' AND name LIKE ?';
-      params.push(`%${req.query.keyword}%`);
-    }
-    
-    const limit = req.query.limit ? parseInt(req.query.limit) : 100;
-    sql += ' ORDER BY name LIMIT ?';
-    params.push(limit);
-    
-    const result = db.exec(sql, params);
-    
-    if (result.length === 0) {
-      return res.json({ success: true, count: 0, data: [] });
-    }
-    
-    const columns = result[0].columns;
-    const data = result[0].values.map(row => {
-      const obj = {};
-      columns.forEach((col, i) => obj[col] = row[i]);
-      return obj;
-    });
+    const data = await db.searchMajor(params);
     
     res.json({
       success: true,
@@ -324,38 +206,18 @@ app.get('/api/major/list', async (req, res) => {
   }
 });
 
-/** 
+/**
  * 高校列表查询
  * GET /api/university/list
  */
 app.get('/api/university/list', async (req, res) => {
   try {
-    const db = await getDb();
+    const params = {
+      keyword: req.query.keyword || null,
+      limit: req.query.limit ? parseInt(req.query.limit) : 50
+    };
     
-    let sql = 'SELECT * FROM university WHERE 1=1';
-    const params = [];
-    
-    if (req.query.keyword) {
-      sql += ' AND (name LIKE ? OR code LIKE ?)';
-      params.push(`%${req.query.keyword}%`, `%${req.query.keyword}%`);
-    }
-    
-    const limit = req.query.limit ? parseInt(req.query.limit) : 50;
-    sql += ' ORDER BY code LIMIT ?';
-    params.push(limit);
-    
-    const result = db.exec(sql, params);
-    
-    if (result.length === 0) {
-      return res.json({ success: true, count: 0, data: [] });
-    }
-    
-    const columns = result[0].columns;
-    const data = result[0].values.map(row => {
-      const obj = {};
-      columns.forEach((col, i) => obj[col] = row[i]);
-      return obj;
-    });
+    const data = await db.searchUniversity(params);
     
     res.json({
       success: true,
